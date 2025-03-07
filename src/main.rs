@@ -8,6 +8,7 @@ use pixels::{Pixels, SurfaceTexture};
 use scrap::{Capturer, Display};
 use std::io::ErrorKind::WouldBlock;
 use std::time::{Duration, Instant};
+use global_hotkey::{GlobalHotKeyManager, GlobalHotKeyEvent, hotkey::{HotKey, Modifiers, Code}};
 use winit::{
     dpi::PhysicalSize,
     event::{Event, WindowEvent},
@@ -17,6 +18,13 @@ use winit::{
 
 const DEFAULT_WIDTH: u32 = 640;
 const DEFAULT_HEIGHT: u32 = 480;
+const DEBOUNCE_DURATION: Duration = Duration::from_millis(300); // Add debounce duration
+
+#[derive(PartialEq)]
+enum WindowMode {
+    Alignment,
+    Share,
+}
 
 struct App {
     capturer: Capturer,
@@ -25,6 +33,8 @@ struct App {
     window_pos: (i32, i32),
     width: u32,
     height: u32,
+    mode: WindowMode,
+    last_toggle: Instant, // Add this field for debouncing
 }
 
 impl App {
@@ -55,7 +65,34 @@ impl App {
             window_pos,
             width,
             height,
+            mode: WindowMode::Alignment,
+            last_toggle: Instant::now(), // Initialize last_toggle
         })
+    }
+
+    fn toggle_mode(&mut self, window: &Window) {
+        let now = Instant::now();
+        if now.duration_since(self.last_toggle) < DEBOUNCE_DURATION {
+            return; // Ignore toggle if within debounce period
+        }
+        self.last_toggle = now;
+
+        match self.mode {
+            WindowMode::Alignment => {
+                window.set_decorations(false);
+                window.set_content_protected(false);
+                window.set_window_level(winit::window::WindowLevel::AlwaysOnBottom);
+                self.mode = WindowMode::Share;
+                info!("Switched to share mode");
+            },
+            WindowMode::Share => {
+                window.set_decorations(true);
+                window.set_content_protected(true);
+                window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+                self.mode = WindowMode::Alignment;
+                info!("Switched to alignment mode");
+            }
+        }
     }
 
     fn update(&mut self, window: &Window) -> Result<()> {
@@ -179,6 +216,11 @@ fn main() -> Result<()> {
         .with_decorations(true)
         .with_content_protected(true)
         .build(&event_loop)?;
+
+    // Initialize hotkey manager
+    let manager = GlobalHotKeyManager::new().context("Failed to create hotkey manager")?;
+    let hotkey = HotKey::new(Some(Modifiers::SHIFT | Modifiers::CONTROL), Code::BracketLeft);
+    manager.register(hotkey).context("Failed to register hotkey")?;
     
     let mut app = App::new(&window)?;
     let mut last_update = Instant::now();
@@ -186,6 +228,11 @@ fn main() -> Result<()> {
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
+
+        // Check for hotkey events
+        if let Ok(_) = GlobalHotKeyEvent::receiver().try_recv() {
+            app.toggle_mode(&window);
+        }
         
         match event {
             Event::WindowEvent {
