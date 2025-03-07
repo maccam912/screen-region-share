@@ -6,7 +6,7 @@ use std::io::ErrorKind::WouldBlock;
 use std::time::{Duration, Instant};
 use global_hotkey::{GlobalHotKeyManager, GlobalHotKeyEvent, hotkey::{HotKey, Modifiers, Code}};
 use winit::{
-    dpi::PhysicalSize,
+    dpi::{PhysicalPosition, PhysicalSize},
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
@@ -26,11 +26,12 @@ struct App {
     capturer: Capturer,
     display_info: Display,
     pixels: Pixels,
-    window_pos: (i32, i32),
+    window_pos: PhysicalPosition<i32>,  // Change to PhysicalPosition for clarity
     width: u32,
     height: u32,
     mode: WindowMode,
-    last_toggle: Instant, // Add this field for debouncing
+    last_toggle: Instant,
+    scale_factor: f64,  // Add scale factor field
 }
 
 impl App {
@@ -46,13 +47,16 @@ impl App {
         let pixels = Pixels::new(width, height, surface_texture)
             .context("Failed to create pixels instance")?;
 
-        // Get initial window position - use inner_position for client area only
+        // Get initial window position as physical pixels
         let window_pos = window.inner_position()
-            .unwrap_or_default()
-            .into();
+            .unwrap_or_default();
             
         // Get the primary display again for reference
         let display_info = Display::primary().context("Couldn't get primary display info")?;
+        
+        // Get scale factor from window
+        let scale_factor = window.scale_factor();
+        info!("Current window scale factor: {}", scale_factor);
 
         Ok(Self {
             capturer,
@@ -62,7 +66,8 @@ impl App {
             width,
             height,
             mode: WindowMode::Alignment,
-            last_toggle: Instant::now(), // Initialize last_toggle
+            last_toggle: Instant::now(),
+            scale_factor,
         })
     }
 
@@ -94,7 +99,14 @@ impl App {
     fn update(&mut self, window: &Window) -> Result<()> {
         // Update window position if changed - use inner_position for client area only
         if let Ok(position) = window.inner_position() {
-            self.window_pos = position.into();
+            self.window_pos = position;
+        }
+        
+        // Update scale factor in case it changed
+        let new_scale_factor = window.scale_factor();
+        if (new_scale_factor - self.scale_factor).abs() > f64::EPSILON {
+            info!("Scale factor changed from {} to {}", self.scale_factor, new_scale_factor);
+            self.scale_factor = new_scale_factor;
         }
         
         // Capture screen region and update pixels
@@ -125,8 +137,9 @@ impl App {
         let height = self.height;
         let frame = self.pixels.frame_mut();
         
-        // Calculate the actual position on the screen where the window is
-        let (window_x, window_y) = self.window_pos;
+        // Get window position in physical pixels
+        let window_x = self.window_pos.x;
+        let window_y = self.window_pos.y;
         
         // Get capturer frame dimensions
         let display_width = self.display_info.width() as usize;
@@ -135,7 +148,7 @@ impl App {
         for y in 0..height as usize {
             for x in 0..width as usize {
                 // Calculate the corresponding position in the captured screen
-                // Use saturating_add to prevent overflow
+                // The window_pos is already in physical pixels (screen coordinates)
                 let screen_x = if window_x < 0 {
                     x.saturating_sub(window_x.unsigned_abs() as usize)
                 } else {
@@ -212,6 +225,8 @@ fn main() -> Result<()> {
         .with_decorations(true)
         .with_content_protected(true)
         .build(&event_loop)?;
+        
+    info!("Window scale factor: {}", window.scale_factor());
 
     // Initialize hotkey manager
     let manager = GlobalHotKeyManager::new().context("Failed to create hotkey manager")?;
@@ -244,6 +259,15 @@ fn main() -> Result<()> {
                 ..
             } => {
                 app.resize(new_size);
+            }
+            
+            Event::WindowEvent {
+                event: WindowEvent::ScaleFactorChanged { scale_factor, new_inner_size, .. },
+                ..
+            } => {
+                info!("Scale factor changed to {}", scale_factor);
+                app.scale_factor = scale_factor;
+                app.resize(*new_inner_size);
             }
 
             Event::MainEventsCleared => {
