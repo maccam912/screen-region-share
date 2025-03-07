@@ -1,3 +1,7 @@
+#[cfg(target_os = "macos")]
+#[macro_use]
+extern crate objc;
+
 use anyhow::{Context, Result};
 use log::{error, info, warn};
 use pixels::{Pixels, SurfaceTexture};
@@ -11,8 +15,59 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
+// Windows API imports
+#[cfg(target_os = "windows")]
+use windows::{
+    Win32::Foundation::HWND,
+    Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE},
+};
+#[cfg(target_os = "windows")]
+use winit::platform::windows::WindowExtWindows;
+
+// macOS imports
+#[cfg(target_os = "macos")]
+use {
+    cocoa::appkit::NSWindowSharingNone,
+    cocoa::base::nil,
+    objc::runtime::Object,
+    winit::platform::macos::WindowExtMacOS,
+};
+
 const DEFAULT_WIDTH: u32 = 640;
 const DEFAULT_HEIGHT: u32 = 480;
+
+// Helper function to exclude window from screen capture on Windows
+#[cfg(target_os = "windows")]
+fn exclude_window_from_capture(window: &Window) {
+    info!("Setting WDA_EXCLUDEFROMCAPTURE on window");
+    unsafe {
+        let hwnd = HWND(window.hwnd() as isize);
+        let result = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        if !result.as_bool() {
+            warn!("Failed to set WDA_EXCLUDEFROMCAPTURE");
+        }
+    }
+}
+
+// Helper function to exclude window from screen capture on macOS
+#[cfg(target_os = "macos")]
+fn exclude_window_from_capture(window: &Window) {
+    info!("Setting NSWindowSharingNone on window");
+    unsafe {
+        let ns_window = window.ns_window() as *mut Object;
+        if ns_window != nil {
+            let _: () = msg_send![ns_window, setShareTypes: NSWindowSharingNone];
+        } else {
+            warn!("Failed to get NSWindow reference");
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn exclude_window_from_capture(_window: &Window) {
+    // Do nothing on unsupported platforms
+    warn!("Window exclusion from capture is not supported on this platform");
+}
 
 struct App {
     capturer: Capturer,
@@ -174,6 +229,9 @@ fn main() -> Result<()> {
         .with_min_inner_size(PhysicalSize::new(100, 100))
         .with_decorations(true)
         .build(&event_loop)?;
+    
+    // Exclude window from screen capture
+    exclude_window_from_capture(&window);
     
     let mut app = App::new(&window)?;
     let mut last_update = Instant::now();
