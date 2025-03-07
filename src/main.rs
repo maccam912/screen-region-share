@@ -1,16 +1,18 @@
 use anyhow::{Context, Result};
+use global_hotkey::{
+    hotkey::{Code, HotKey, Modifiers},
+    GlobalHotKeyEvent, GlobalHotKeyManager,
+};
 use log::{error, info, warn};
 use pixels::{Pixels, SurfaceTexture};
-use scrap::{Capturer, Display};
-use std::io::ErrorKind::WouldBlock;
 use std::time::{Duration, Instant};
-use global_hotkey::{GlobalHotKeyManager, GlobalHotKeyEvent, hotkey::{HotKey, Modifiers, Code}};
 use winit::{
     dpi::PhysicalSize,
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
+use xcap::Monitor;
 
 const DEFAULT_WIDTH: u32 = 640;
 const DEFAULT_HEIGHT: u32 = 480;
@@ -23,8 +25,7 @@ enum WindowMode {
 }
 
 struct App {
-    capturer: Capturer,
-    display_info: Display,
+    monitor: Monitor,
     pixels: Pixels,
     window_inner_pos: (i32, i32),
     width: u32,
@@ -35,9 +36,10 @@ struct App {
 
 impl App {
     fn new(window: &Window) -> Result<Self> {
-        let display = Display::primary().context("Couldn't find primary display")?;
-        let capturer = Capturer::new(display).context("Couldn't begin capture")?;
-        
+        // Get primary monitor
+        let monitors = Monitor::all().context("Couldn't get monitors")?;
+        let monitor = monitors.into_iter().next().context("No monitors found")?;
+
         // Create a surface for rendering
         let size = window.inner_size();
         let width = size.width;
@@ -47,15 +49,10 @@ impl App {
             .context("Failed to create pixels instance")?;
 
         // Get initial window inner position as physical pixels
-        let window_inner_pos = window.inner_position()
-            .unwrap_or_default();
-            
-        // Get the primary display again for reference
-        let display_info = Display::primary().context("Couldn't get primary display info")?;
+        let window_inner_pos = window.inner_position().unwrap_or_default();
 
         Ok(Self {
-            capturer,
-            display_info,
+            monitor,
             pixels,
             window_inner_pos: (window_inner_pos.x, window_inner_pos.y),
             width,
@@ -79,7 +76,7 @@ impl App {
                 window.set_window_level(winit::window::WindowLevel::AlwaysOnBottom);
                 self.mode = WindowMode::Share;
                 info!("Switched to share mode");
-            },
+            }
             WindowMode::Share => {
                 window.set_decorations(true);
                 window.set_content_protected(true);
@@ -95,42 +92,41 @@ impl App {
         if let Ok(position) = window.inner_position() {
             self.window_inner_pos = (position.x, position.y);
         }
-        
+
         // Capture screen region and update pixels
         self.capture_and_update()?;
-        
+
         Ok(())
     }
 
     fn capture_and_update(&mut self) -> Result<()> {
-        // Get capturer dimensions first before the mutable borrow
-        let capturer_width = self.capturer.width();
-        let stride = capturer_width as usize * 4; // 4 bytes per pixel (BGRA)
-        
-        // Try to get a frame
-        let buffer = match self.capturer.frame() {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                if error.kind() == WouldBlock {
-                    // Not ready yet, try again later
-                    return Ok(());
-                } else {
-                    return Err(error.into());
-                }
-            }
-        };
+        // Capture the screen using xcap
+        let captured_image = self
+            .monitor
+            .capture_image()
+            .context("Failed to capture screen")?;
 
         let width = self.width;
         let height = self.height;
         let frame = self.pixels.frame_mut();
-        
+
         // Get inner window position in physical pixels
         let window_x = self.window_inner_pos.0;
         let window_y = self.window_inner_pos.1;
-        
-        // Get capturer frame dimensions
-        let display_width = self.display_info.width() as usize;
-        let display_height = self.display_info.height() as usize;
+
+        // Get monitor dimensions - handle Results properly
+        let display_width = self
+            .monitor
+            .width()
+            .context("Failed to get monitor width")? as usize;
+        let display_height = self
+            .monitor
+            .height()
+            .context("Failed to get monitor height")? as usize;
+
+        // Get image dimensions and raw RGBA pixels
+        let image_width = captured_image.width() as usize;
+        let pixels_data = captured_image.as_raw(); // Gets raw pixel data
 
         for y in 0..height as usize {
             for x in 0..width as usize {
@@ -141,28 +137,36 @@ impl App {
                 } else {
                     x.saturating_add(window_x as usize)
                 };
-                
+
                 let screen_y = if window_y < 0 {
                     y.saturating_sub(window_y.unsigned_abs() as usize)
                 } else {
                     y.saturating_add(window_y as usize)
                 };
-                
+
                 // Skip if outside capture area
                 if screen_x >= display_width || screen_y >= display_height {
                     continue;
                 }
-                
+
                 // Calculate buffer indices safely with checked math
-                if let Some(buffer_idx) = screen_y.checked_mul(stride).and_then(|v| v.checked_add(screen_x * 4)) {
-                    if buffer_idx + 3 < buffer.len() {
-                        let b = buffer[buffer_idx];
-                        let g = buffer[buffer_idx + 1];
-                        let r = buffer[buffer_idx + 2];
-                        let a = buffer[buffer_idx + 3];
-                        
+                // image uses RGBA format, 4 bytes per pixel
+                if let Some(buffer_idx) = screen_y
+                    .checked_mul(image_width * 4)
+                    .and_then(|v| v.checked_add(screen_x * 4))
+                {
+                    if buffer_idx + 3 < pixels_data.len() {
+                        let r = pixels_data[buffer_idx];
+                        let g = pixels_data[buffer_idx + 1];
+                        let b = pixels_data[buffer_idx + 2];
+                        let a = pixels_data[buffer_idx + 3];
+
                         // Set pixel in our frame (RGBA format for pixels crate)
-                        if let Some(frame_idx) = y.checked_mul(width as usize).and_then(|v| v.checked_add(x)).map(|v| v * 4) {
+                        if let Some(frame_idx) = y
+                            .checked_mul(width as usize)
+                            .and_then(|v| v.checked_add(x))
+                            .map(|v| v * 4)
+                        {
                             if frame_idx + 3 < frame.len() {
                                 frame[frame_idx] = r;
                                 frame[frame_idx + 1] = g;
@@ -187,12 +191,12 @@ impl App {
         if new_size.width > 0 && new_size.height > 0 {
             self.width = new_size.width;
             self.height = new_size.height;
-            
+
             // Handle the Result from resize operations
             if let Err(e) = self.pixels.resize_surface(new_size.width, new_size.height) {
                 warn!("Failed to resize surface: {}", e);
             }
-            
+
             if let Err(e) = self.pixels.resize_buffer(new_size.width, new_size.height) {
                 warn!("Failed to resize buffer: {}", e);
             }
@@ -215,9 +219,14 @@ fn main() -> Result<()> {
 
     // Initialize hotkey manager
     let manager = GlobalHotKeyManager::new().context("Failed to create hotkey manager")?;
-    let hotkey = HotKey::new(Some(Modifiers::SHIFT | Modifiers::CONTROL), Code::BracketLeft);
-    manager.register(hotkey).context("Failed to register hotkey")?;
-    
+    let hotkey = HotKey::new(
+        Some(Modifiers::SHIFT | Modifiers::CONTROL),
+        Code::BracketLeft,
+    );
+    manager
+        .register(hotkey)
+        .context("Failed to register hotkey")?;
+
     let mut app = App::new(&window)?;
     let mut last_update = Instant::now();
     let frame_rate = Duration::from_millis(1000 / 30); // 30 FPS
@@ -229,7 +238,7 @@ fn main() -> Result<()> {
         if let Ok(_) = GlobalHotKeyEvent::receiver().try_recv() {
             app.toggle_mode(&window);
         }
-        
+
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -238,7 +247,7 @@ fn main() -> Result<()> {
                 info!("Window close requested");
                 *control_flow = ControlFlow::Exit;
             }
-            
+
             Event::WindowEvent {
                 event: WindowEvent::Resized(new_size),
                 ..
@@ -254,21 +263,21 @@ fn main() -> Result<()> {
                 let now = Instant::now();
                 if now - last_update >= frame_rate {
                     last_update = now;
-                    
+
                     if let Err(err) = app.update(&window) {
                         error!("Update error: {}", err);
                         *control_flow = ControlFlow::Exit;
                         return;
                     }
                 }
-                
+
                 if let Err(err) = app.render() {
                     error!("Render error: {}", err);
                     *control_flow = ControlFlow::Exit;
                     return;
                 }
             }
-            
+
             _ => {}
         }
     });
