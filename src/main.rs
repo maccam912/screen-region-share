@@ -1,7 +1,3 @@
-#[cfg(target_os = "macos")]
-#[macro_use]
-extern crate objc;
-
 use anyhow::{Context, Result};
 use log::{error, info, warn};
 use pixels::{Pixels, SurfaceTexture};
