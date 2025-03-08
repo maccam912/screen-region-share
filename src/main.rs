@@ -5,6 +5,7 @@ use global_hotkey::{
 };
 use log::{error, info, warn};
 use pixels::{Pixels, SurfaceTexture};
+use rayon::prelude::*;
 use std::time::{Duration, Instant};
 use winit::{
     dpi::PhysicalSize,
@@ -106,8 +107,8 @@ impl App {
             .capture_image()
             .context("Failed to capture screen")?;
 
-        let width = self.width;
-        let height = self.height;
+        let width = self.width as usize;
+        let height = self.height as usize;
         let frame = self.pixels.frame_mut();
 
         // Get inner window position in physical pixels
@@ -128,56 +129,18 @@ impl App {
         let image_width = captured_image.width() as usize;
         let pixels_data = captured_image.as_raw(); // Gets raw pixel data
 
-        for y in 0..height as usize {
-            for x in 0..width as usize {
-                // Calculate the corresponding position in the captured screen
-                // Using inner_position for accurate content area positioning
-                let screen_x = if window_x < 0 {
-                    x.saturating_sub(window_x.unsigned_abs() as usize)
-                } else {
-                    x.saturating_add(window_x as usize)
-                };
-
-                let screen_y = if window_y < 0 {
-                    y.saturating_sub(window_y.unsigned_abs() as usize)
-                } else {
-                    y.saturating_add(window_y as usize)
-                };
-
-                // Skip if outside capture area
-                if screen_x >= display_width || screen_y >= display_height {
-                    continue;
-                }
-
-                // Calculate buffer indices safely with checked math
-                // image uses RGBA format, 4 bytes per pixel
-                if let Some(buffer_idx) = screen_y
-                    .checked_mul(image_width * 4)
-                    .and_then(|v| v.checked_add(screen_x * 4))
-                {
-                    if buffer_idx + 3 < pixels_data.len() {
-                        let r = pixels_data[buffer_idx];
-                        let g = pixels_data[buffer_idx + 1];
-                        let b = pixels_data[buffer_idx + 2];
-                        let a = pixels_data[buffer_idx + 3];
-
-                        // Set pixel in our frame (RGBA format for pixels crate)
-                        if let Some(frame_idx) = y
-                            .checked_mul(width as usize)
-                            .and_then(|v| v.checked_add(x))
-                            .map(|v| v * 4)
-                        {
-                            if frame_idx + 3 < frame.len() {
-                                frame[frame_idx] = r;
-                                frame[frame_idx + 1] = g;
-                                frame[frame_idx + 2] = b;
-                                frame[frame_idx + 3] = a;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Process image data in parallel using rayon
+        process_image_parallel(
+            frame,
+            pixels_data,
+            width,
+            height,
+            window_x,
+            window_y,
+            image_width,
+            display_width,
+            display_height,
+        );
 
         Ok(())
     }
@@ -202,6 +165,77 @@ impl App {
             }
         }
     }
+}
+
+/// Process the image data in parallel using Rayon
+fn process_image_parallel(
+    frame: &mut [u8],
+    pixels_data: &[u8],
+    width: usize,
+    height: usize,
+    window_x: i32,
+    window_y: i32,
+    image_width: usize,
+    display_width: usize,
+    display_height: usize,
+) {
+    // Create row chunks that we can process in parallel
+    let chunk_size = width * 4;
+    let frame_chunks: Vec<_> = frame.chunks_mut(chunk_size).take(height).collect();
+    
+    // Process rows in parallel
+    frame_chunks.into_par_iter().enumerate().for_each(|(y, row_chunk)| {
+        // Calculate screen Y position
+        let screen_y = if window_y < 0 {
+            y.saturating_sub(window_y.unsigned_abs() as usize)
+        } else {
+            y.saturating_add(window_y as usize)
+        };
+
+        // Skip if row is outside display area
+        if screen_y >= display_height {
+            return;
+        }
+
+        // Calculate source buffer row start
+        let src_row_start = screen_y * image_width * 4;
+        
+        // Process in chunks of 16 bytes for better cache utilization
+        // This aligns well with most CPU cache lines
+        let chunks = (0..width).step_by(4);
+        
+        for x_start in chunks {
+            // Process a chunk of 4 pixels at a time (16 bytes)
+            let chunk_end = (x_start + 4).min(width);
+            
+            for x in x_start..chunk_end {
+                // Calculate screen X position
+                let screen_x = if window_x < 0 {
+                    x.saturating_sub(window_x.unsigned_abs() as usize)
+                } else {
+                    x.saturating_add(window_x as usize)
+                };
+
+                // Skip if outside capture area
+                if screen_x >= display_width {
+                    continue;
+                }
+
+                // Calculate source buffer position
+                let src_pos = src_row_start + screen_x * 4;
+                let dest_pos = x * 4;
+
+                // Bounds check and copy pixel
+                if src_pos + 3 < pixels_data.len() && dest_pos + 3 < row_chunk.len() {
+                    // Copy RGBA values directly
+                    row_chunk[dest_pos] = pixels_data[src_pos];
+                    row_chunk[dest_pos + 1] = pixels_data[src_pos + 1];
+                    row_chunk[dest_pos + 2] = pixels_data[src_pos + 2];
+                    row_chunk[dest_pos + 3] = pixels_data[src_pos + 3];
+                }
+            }
+        }
+    });
 }
 
 fn main() -> Result<()> {
