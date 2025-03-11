@@ -226,20 +226,41 @@ fn crop_frame(
     new_width: u32,
     new_height: u32,
 ) -> Vec<u8> {
-    let mut new_frame = vec![0; (new_width * new_height * 4) as usize];
-
-    // Check for out-of-bounds access
-    if frame.len() < new_frame.len() + (upper_left_y * original_width + upper_left_x) as usize * 4 {
-        return new_frame;
+    let bytes_per_pixel: usize = 4; // RGBA format
+    let new_frame_size = (new_width * new_height) as usize * bytes_per_pixel;
+    let mut new_frame = Vec::with_capacity(new_frame_size);
+    unsafe {
+        new_frame.set_len(new_frame_size);
     }
 
-    // Copy whole rows at a time for efficiency
+    // Early return if the requested region is out of bounds
+    let original_stride = original_width as usize * bytes_per_pixel;
+    let new_stride = new_width as usize * bytes_per_pixel;
+
+    // Calculate starting offset in the source frame
+    let start_offset = (upper_left_y * original_width + upper_left_x) as usize * bytes_per_pixel;
+
+    // Check if any part of the region is out of bounds
+    if start_offset >= frame.len()
+        || upper_left_x + new_width > original_width
+        || (start_offset + (new_height as usize - 1) * original_stride + new_stride > frame.len())
+    {
+        return new_frame; // Return empty frame if out of bounds
+    }
+
+    // Use SIMD-friendly copy when possible - memcpy for each row
     for y in 0..new_height {
-        let original_y = upper_left_y + y;
-        let original_index = (original_y * original_width + upper_left_x) as usize * 4;
-        let new_index = (y * new_width) as usize * 4;
-        new_frame[new_index..new_index + (new_width * 4) as usize]
-            .copy_from_slice(&frame[original_index..original_index + (new_width * 4) as usize]);
+        let src_offset = start_offset + (y as usize * original_width as usize) * bytes_per_pixel;
+        let dst_offset = (y as usize * new_width as usize) * bytes_per_pixel;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                frame.as_ptr().add(src_offset),
+                new_frame.as_mut_ptr().add(dst_offset),
+                new_stride,
+            );
+        }
     }
+
     new_frame
 }
