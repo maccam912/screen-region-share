@@ -1,90 +1,72 @@
-name: Build and Release
+name: Release
 
 on:
-  release:
-    types: [created]
+  push:
+    tags:
+      - 'v*'
 
 jobs:
-  build-windows:
-    name: Build Windows (${{ matrix.arch }})
-    runs-on: windows-latest
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+  build-and-upload:
+    needs: create-release
+    name: Build and Upload for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        arch: [x86_64, aarch64]
         include:
-          - arch: x86_64
-            target: x86_64-pc-windows-msvc
-          - arch: aarch64
-            target: aarch64-pc-windows-msvc
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+          - os: ubuntu-latest
+            artifact_name: screen-region-share
+            asset_name: screen-region-share-linux-amd64
+            dependencies: libxcb-shape0-dev libxcb-xfixes0-dev libxdo-dev libx11-dev
+          - os: windows-latest
+            artifact_name: screen-region-share.exe
+            asset_name: screen-region-share-windows-amd64.exe
+          - os: macos-latest
+            artifact_name: screen-region-share
+            asset_name: screen-region-share-macos-amd64
 
-      - name: Install Rust
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Setup Rust toolchain
         uses: actions-rs/toolchain@v1
         with:
+          profile: minimal
           toolchain: stable
-          target: ${{ matrix.target }}
           override: true
 
-      - name: Build binary
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.dependencies }}
+
+      - name: Build for release
         uses: actions-rs/cargo@v1
         with:
           command: build
-          args: --release --target ${{ matrix.target }}
+          args: --release
 
-      - name: Package binary
-        run: |
-          mkdir release-artifacts
-          cp target/${{ matrix.target }}/release/screen-region-share.exe release-artifacts/screen-region-share-${{ matrix.arch }}-windows.exe
-      
-      - name: Upload binary to release
-        uses: svenstaro/upload-release-action@v2
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: release-artifacts/screen-region-share-${{ matrix.arch }}-windows.exe
-          asset_name: screen-region-share-${{ matrix.arch }}-windows.exe
-          tag: ${{ github.ref }}
-
-  build-macos:
-    name: Build macOS (${{ matrix.arch }})
-    runs-on: macos-latest
-    strategy:
-      matrix:
-        arch: [x86_64, aarch64]
-        include:
-          - arch: x86_64
-            target: x86_64-apple-darwin
-          - arch: aarch64
-            target: aarch64-apple-darwin
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          target: ${{ matrix.target }}
-          override: true
-
-      - name: Build binary
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --release --target ${{ matrix.target }}
-
-      - name: Package binary
-        run: |
-          mkdir -p release-artifacts
-          cp target/${{ matrix.target }}/release/screen-region-share release-artifacts/screen-region-share-${{ matrix.arch }}-macos
-      
-      - name: Upload binary to release
-        uses: svenstaro/upload-release-action@v2
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: release-artifacts/screen-region-share-${{ matrix.arch }}-macos
-          asset_name: screen-region-share-${{ matrix.arch }}-macos
-          tag: ${{ github.ref }}
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./target/release/${{ matrix.artifact_name }}
+          asset_name: ${{ matrix.asset_name }}
+          asset_content_type: application/octet-stream
