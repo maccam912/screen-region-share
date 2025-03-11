@@ -1,50 +1,38 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  release:
+    types: [created]
 
 # Add permissions block to fix "Resource not accessible by integration" error
 permissions:
   contents: write
 
 jobs:
-  create-release:
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    steps:
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
-
   build-and-upload:
-    needs: create-release
-    name: Build and Upload for ${{ matrix.os }}
+    name: Build and Upload for ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [windows-latest, macos-latest]
+        arch: [x86_64, arm64]
         include:
-          - os: ubuntu-latest
-            artifact_name: screen-region-share
-            asset_name: screen-region-share-linux-amd64
-            dependencies: libxcb-shape0-dev libxcb-xfixes0-dev libxdo-dev libx11-dev
           - os: windows-latest
+            arch: x86_64
             artifact_name: screen-region-share.exe
             asset_name: screen-region-share-windows-amd64.exe
+          - os: windows-latest
+            arch: arm64
+            artifact_name: screen-region-share.exe
+            asset_name: screen-region-share-windows-arm64.exe
+            target: aarch64-pc-windows-msvc
           - os: macos-latest
+            arch: x86_64
             artifact_name: screen-region-share
             asset_name: screen-region-share-macos-x86_64
             target: x86_64-apple-darwin
           - os: macos-latest
+            arch: arm64
             artifact_name: screen-region-share
             asset_name: screen-region-share-macos-arm64
             target: aarch64-apple-darwin
@@ -60,10 +48,6 @@ jobs:
           toolchain: stable
           override: true
           target: ${{ matrix.target }}
-
-      - name: Install Linux dependencies
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.dependencies }}
 
       - name: Build for release
         uses: actions-rs/cargo@v1
@@ -86,7 +70,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          upload_url: ${{ github.event.release.upload_url }}
           asset_path: ${{ steps.prepare-asset.outputs.asset_path }}
           asset_name: ${{ matrix.asset_name }}
           asset_content_type: application/octet-stream
