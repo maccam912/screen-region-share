@@ -1,284 +1,266 @@
-use anyhow::{Context, Result};
-use global_hotkey::{
-    hotkey::{Code, HotKey, Modifiers},
-    GlobalHotKeyEvent, GlobalHotKeyManager,
-};
-use log::{error, info, warn};
-use pixels::{Pixels, SurfaceTexture};
-use std::time::{Duration, Instant};
-use winit::{
-    dpi::PhysicalSize,
-    event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
-    window::{Window, WindowBuilder},
-};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use bevy::window::CompositeAlphaMode;
+use bevy::window::{WindowFocused, WindowMoved, WindowResized};
+use bevy::{prelude::*, render::render_resource::Extent3d, window::WindowResolution};
+use crossbeam_channel::{Receiver, Sender, bounded};
+use std::thread;
 use xcap::Monitor;
 
-const DEFAULT_WIDTH: u32 = 640;
-const DEFAULT_HEIGHT: u32 = 480;
-const DEBOUNCE_DURATION: Duration = Duration::from_millis(300); // Add debounce duration
+#[derive(Component)]
+struct Screencap;
 
-#[derive(PartialEq)]
-enum WindowMode {
-    Alignment,
-    Share,
+#[derive(Resource)]
+struct FrameReceiver(Receiver<Vec<u8>>);
+
+#[derive(Resource)]
+struct WindowSize {
+    width: f32,
+    height: f32,
 }
 
-struct App {
-    monitor: Monitor,
-    pixels: Pixels,
-    window_inner_pos: (i32, i32),
-    width: u32,
-    height: u32,
-    mode: WindowMode,
-    last_toggle: Instant,
+#[derive(Resource)]
+struct ResizeSender(Sender<(u32, u32)>);
+
+#[derive(Resource)]
+struct WindowPosition {
+    x: u32,
+    y: u32,
 }
 
-impl App {
-    fn new(window: &Window) -> Result<Self> {
-        // Get primary monitor
-        let monitors = Monitor::all().context("Couldn't get monitors")?;
-        let monitor = monitors.into_iter().next().context("No monitors found")?;
+#[derive(Resource)]
+struct PositionSender(Sender<(u32, u32)>);
 
-        // Create a surface for rendering
-        let size = window.inner_size();
-        let width = size.width;
-        let height = size.height;
-        let surface_texture = SurfaceTexture::new(width, height, window);
-        let pixels = Pixels::new(width, height, surface_texture)
-            .context("Failed to create pixels instance")?;
+fn main() {
+    let (tx, rx) = bounded(1);
+    let (resize_tx, resize_rx) = bounded(1);
+    let (position_tx, position_rx) = bounded(1);
+    let frame_receiver = FrameReceiver(rx);
+    let window_size = WindowSize {
+        width: 800.0,
+        height: 600.0,
+    }; // Default size
+    let resize_sender = ResizeSender(resize_tx);
+    let window_position = WindowPosition { x: 0, y: 0 }; // Default position
+    let position_sender = PositionSender(position_tx);
 
-        // Get initial window inner position as physical pixels
-        let window_inner_pos = window.inner_position().unwrap_or_default();
+    thread::spawn(move || {
+        let monitor = Monitor::from_point(0, 0).unwrap();
+        let (video_recorder, sx) = monitor.video_recorder().unwrap();
+        video_recorder.start().unwrap();
 
-        Ok(Self {
-            monitor,
-            pixels,
-            window_inner_pos: (window_inner_pos.x, window_inner_pos.y),
-            width,
-            height,
-            mode: WindowMode::Alignment,
-            last_toggle: Instant::now(),
-        })
-    }
+        let mut current_width = 64;
+        let mut current_height = 64;
+        let mut current_x = 1;
+        let mut current_y = 1;
 
-    fn toggle_mode(&mut self, window: &Window) {
-        let now = Instant::now();
-        if now.duration_since(self.last_toggle) < DEBOUNCE_DURATION {
-            return; // Ignore toggle if within debounce period
-        }
-        self.last_toggle = now;
-
-        match self.mode {
-            WindowMode::Alignment => {
-                window.set_decorations(false);
-                window.set_content_protected(false);
-                window.set_window_level(winit::window::WindowLevel::AlwaysOnBottom);
-                self.mode = WindowMode::Share;
-                info!("Switched to share mode");
+        loop {
+            if let Ok((new_width, new_height)) = resize_rx.try_recv() {
+                current_width = new_width;
+                current_height = new_height;
             }
-            WindowMode::Share => {
-                window.set_decorations(true);
-                window.set_content_protected(true);
-                window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
-                self.mode = WindowMode::Alignment;
-                info!("Switched to alignment mode");
+
+            if let Ok((new_x, new_y)) = position_rx.try_recv() {
+                current_x = new_x;
+                current_y = new_y;
             }
-        }
-    }
 
-    fn update(&mut self, window: &Window) -> Result<()> {
-        // Update window position if changed - use inner position for content area
-        if let Ok(position) = window.inner_position() {
-            self.window_inner_pos = (position.x, position.y);
-        }
-
-        // Capture screen region and update pixels
-        self.capture_and_update()?;
-
-        Ok(())
-    }
-
-    fn capture_and_update(&mut self) -> Result<()> {
-        // Capture the screen using xcap
-        let captured_image = self
-            .monitor
-            .capture_image()
-            .context("Failed to capture screen")?;
-
-        let width = self.width;
-        let height = self.height;
-        let frame = self.pixels.frame_mut();
-
-        // Get inner window position in physical pixels
-        let window_x = self.window_inner_pos.0;
-        let window_y = self.window_inner_pos.1;
-
-        // Get monitor dimensions - handle Results properly
-        let display_width = self
-            .monitor
-            .width()
-            .context("Failed to get monitor width")? as usize;
-        let display_height = self
-            .monitor
-            .height()
-            .context("Failed to get monitor height")? as usize;
-
-        // Get image dimensions and raw RGBA pixels
-        let image_width = captured_image.width() as usize;
-        let pixels_data = captured_image.as_raw(); // Gets raw pixel data
-
-        for y in 0..height as usize {
-            for x in 0..width as usize {
-                // Calculate the corresponding position in the captured screen
-                // Using inner_position for accurate content area positioning
-                let screen_x = if window_x < 0 {
-                    x.saturating_sub(window_x.unsigned_abs() as usize)
-                } else {
-                    x.saturating_add(window_x as usize)
-                };
-
-                let screen_y = if window_y < 0 {
-                    y.saturating_sub(window_y.unsigned_abs() as usize)
-                } else {
-                    y.saturating_add(window_y as usize)
-                };
-
-                // Skip if outside capture area
-                if screen_x >= display_width || screen_y >= display_height {
-                    continue;
-                }
-
-                // Calculate buffer indices safely with checked math
-                // image uses RGBA format, 4 bytes per pixel
-                if let Some(buffer_idx) = screen_y
-                    .checked_mul(image_width * 4)
-                    .and_then(|v| v.checked_add(screen_x * 4))
-                {
-                    if buffer_idx + 3 < pixels_data.len() {
-                        let r = pixels_data[buffer_idx];
-                        let g = pixels_data[buffer_idx + 1];
-                        let b = pixels_data[buffer_idx + 2];
-                        let a = pixels_data[buffer_idx + 3];
-
-                        // Set pixel in our frame (RGBA format for pixels crate)
-                        if let Some(frame_idx) = y
-                            .checked_mul(width as usize)
-                            .and_then(|v| v.checked_add(x))
-                            .map(|v| v * 4)
-                        {
-                            if frame_idx + 3 < frame.len() {
-                                frame[frame_idx] = r;
-                                frame[frame_idx + 1] = g;
-                                frame[frame_idx + 2] = b;
-                                frame[frame_idx + 3] = a;
-                            }
-                        }
+            match sx.recv() {
+                Ok(frame) => {
+                    let cropped_frame = crop_frame(
+                        &frame.raw,
+                        frame.width,
+                        current_x,
+                        current_y,
+                        current_width,
+                        current_height,
+                    );
+                    if tx.try_send(cropped_frame).is_err() {
+                        continue;
                     }
                 }
+                _ => continue,
             }
-        }
-
-        Ok(())
-    }
-
-    fn render(&mut self) -> Result<()> {
-        self.pixels.render().context("Render error")?;
-        Ok(())
-    }
-
-    fn resize(&mut self, new_size: PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.width = new_size.width;
-            self.height = new_size.height;
-
-            // Handle the Result from resize operations
-            if let Err(e) = self.pixels.resize_surface(new_size.width, new_size.height) {
-                warn!("Failed to resize surface: {}", e);
-            }
-
-            if let Err(e) = self.pixels.resize_buffer(new_size.width, new_size.height) {
-                warn!("Failed to resize buffer: {}", e);
-            }
-        }
-    }
-}
-
-fn main() -> Result<()> {
-    env_logger::init();
-    info!("Starting screen region share application");
-
-    let event_loop = EventLoop::new();
-    let window = WindowBuilder::new()
-        .with_title("Screen Region Share")
-        .with_inner_size(PhysicalSize::new(DEFAULT_WIDTH, DEFAULT_HEIGHT))
-        .with_min_inner_size(PhysicalSize::new(100, 100))
-        .with_decorations(true)
-        .with_content_protected(true)
-        .build(&event_loop)?;
-
-    // Initialize hotkey manager
-    let manager = GlobalHotKeyManager::new().context("Failed to create hotkey manager")?;
-    let hotkey = HotKey::new(
-        Some(Modifiers::SHIFT | Modifiers::CONTROL),
-        Code::BracketLeft,
-    );
-    manager
-        .register(hotkey)
-        .context("Failed to register hotkey")?;
-
-    let mut app = App::new(&window)?;
-    let mut last_update = Instant::now();
-    let frame_rate = Duration::from_millis(1000 / 30); // 30 FPS
-
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Poll;
-
-        // Check for hotkey events
-        if let Ok(_) = GlobalHotKeyEvent::receiver().try_recv() {
-            app.toggle_mode(&window);
-        }
-
-        match event {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                info!("Window close requested");
-                *control_flow = ControlFlow::Exit;
-            }
-
-            Event::WindowEvent {
-                event: WindowEvent::Resized(new_size),
-                ..
-            } => {
-                app.resize(new_size);
-            }
-
-            Event::MainEventsCleared => {
-                window.request_redraw();
-            }
-
-            Event::RedrawRequested(_) => {
-                let now = Instant::now();
-                if now - last_update >= frame_rate {
-                    last_update = now;
-
-                    if let Err(err) = app.update(&window) {
-                        error!("Update error: {}", err);
-                        *control_flow = ControlFlow::Exit;
-                        return;
-                    }
-                }
-
-                if let Err(err) = app.render() {
-                    error!("Render error: {}", err);
-                    *control_flow = ControlFlow::Exit;
-                    return;
-                }
-            }
-
-            _ => {}
         }
     });
+
+    App::new()
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                // Setting `transparent` allows the `ClearColor`'s alpha value to take effect
+                transparent: true,
+                // Disabling window decorations to make it feel more like a widget than a window
+                decorations: true,
+                resolution: WindowResolution::new(800.0, 600.0).with_scale_factor_override(1.0),
+                #[cfg(target_os = "macos")]
+                composite_alpha_mode: CompositeAlphaMode::PostMultiplied,
+                #[cfg(target_os = "linux")]
+                composite_alpha_mode: CompositeAlphaMode::PreMultiplied,
+                ..default()
+            }),
+            ..default()
+        }))
+        // ClearColor must have 0 alpha, otherwise some color will bleed through
+        .insert_resource(ClearColor(Color::NONE))
+        .insert_resource(frame_receiver)
+        .insert_resource(window_size)
+        .insert_resource(resize_sender)
+        .insert_resource(window_position)
+        .insert_resource(position_sender)
+        .add_systems(Startup, setup)
+        .add_systems(Update, update_sprite_image)
+        .add_systems(Update, on_resize_system)
+        .add_systems(Update, on_move_system)
+        .add_systems(Update, on_focus_system)
+        .run();
+}
+
+fn setup(mut commands: Commands) {
+    commands.spawn(Camera2d);
+    commands.spawn((
+        Screencap,
+        Sprite {
+            color: Color::srgba(1.0, 1.0, 1.0, 0.90),
+            ..default()
+        },
+    ));
+}
+
+fn on_resize_system(
+    mut images: ResMut<Assets<Image>>,
+    mut window_size: ResMut<WindowSize>,
+    mut resize_reader: EventReader<WindowResized>,
+    query: Query<(&Screencap, &mut Sprite)>,
+    resize_sender: Res<ResizeSender>,
+) {
+    for e in resize_reader.read() {
+        window_size.width = e.width;
+        window_size.height = e.height;
+        resize_sender
+            .0
+            .send((e.width as u32, e.height as u32))
+            .unwrap();
+    }
+
+    let Ok((_, sprite)) = query.get_single() else {
+        return;
+    };
+
+    let Some(image) = images.get_mut(&sprite.image) else {
+        return;
+    };
+
+    let new_size = Extent3d {
+        width: window_size.width as u32,
+        height: window_size.height as u32,
+        ..default()
+    };
+    image.resize(new_size);
+}
+
+fn on_move_system(
+    mut window_position: ResMut<WindowPosition>,
+    mut move_reader: EventReader<WindowMoved>,
+    position_sender: Res<PositionSender>,
+) {
+    for e in move_reader.read() {
+        window_position.x = e.position.x as u32;
+        window_position.y = e.position.y as u32;
+        position_sender
+            .0
+            .send((window_position.x, window_position.y))
+            .unwrap();
+    }
+}
+
+fn on_focus_system(
+    mut window: Single<&mut Window>,
+    mut focus_reader: EventReader<WindowFocused>,
+    mut query: Query<&mut Sprite, With<Screencap>>,
+) {
+    for e in focus_reader.read() {
+        if e.focused {
+            println!("Focused");
+            window.decorations = true;
+            if let Ok(mut sprite) = query.get_single_mut() {
+                sprite.color.set_alpha(0.5);
+            }
+        } else {
+            println!("Unfocused");
+            window.decorations = false;
+            if let Ok(mut sprite) = query.get_single_mut() {
+                sprite.color.set_alpha(0.9);
+            }
+        }
+    }
+}
+
+fn update_sprite_image(
+    mut images: ResMut<Assets<Image>>,
+    frame_receiver: Res<FrameReceiver>,
+    window: Single<&Window>,
+    query: Query<(&Screencap, &mut Sprite)>,
+) {
+    let Ok((_, sprite)) = query.get_single() else {
+        return;
+    };
+
+    let Some(image) = images.get_mut(&sprite.image) else {
+        return;
+    };
+
+    if let Ok(new_frame) = frame_receiver.0.try_recv() {
+        if !window.focused {
+            image.data = new_frame;
+        } else {
+            let buff = vec![128; image.data.len() * 4];
+            image.data = buff;
+        }
+    }
+}
+
+fn crop_frame(
+    frame: &[u8],
+    original_width: u32,
+    upper_left_x: u32,
+    upper_left_y: u32,
+    new_width: u32,
+    new_height: u32,
+) -> Vec<u8> {
+    let bytes_per_pixel: usize = 4; // RGBA format
+    let new_frame_size = (new_width * new_height) as usize * bytes_per_pixel;
+    let mut new_frame = Vec::with_capacity(new_frame_size);
+    unsafe {
+        new_frame.set_len(new_frame_size);
+    }
+
+    // Early return if the requested region is out of bounds
+    let original_stride = original_width as usize * bytes_per_pixel;
+    let new_stride = new_width as usize * bytes_per_pixel;
+
+    // Calculate starting offset in the source frame
+    let start_offset = (upper_left_y * original_width + upper_left_x) as usize * bytes_per_pixel;
+
+    // Check if any part of the region is out of bounds
+    if start_offset >= frame.len()
+        || upper_left_x + new_width > original_width
+        || (start_offset + (new_height as usize - 1) * original_stride + new_stride > frame.len())
+    {
+        return new_frame; // Return empty frame if out of bounds
+    }
+
+    // Use SIMD-friendly copy when possible - memcpy for each row
+    for y in 0..new_height {
+        let src_offset = start_offset + (y as usize * original_width as usize) * bytes_per_pixel;
+        let dst_offset = (y as usize * new_width as usize) * bytes_per_pixel;
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                frame.as_ptr().add(src_offset),
+                new_frame.as_mut_ptr().add(dst_offset),
+                new_stride,
+            );
+        }
+    }
+
+    new_frame
 }
